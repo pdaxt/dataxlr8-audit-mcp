@@ -1,10 +1,104 @@
-use dataxlr8_mcp_core::mcp::{empty_schema, error_result, get_i64, get_str, json_result, make_schema};
+use dataxlr8_mcp_core::mcp::{error_result, get_i64, get_str, json_result, make_schema};
 use dataxlr8_mcp_core::Database;
 use rmcp::model::*;
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::ServerHandler;
 use serde::{Deserialize, Serialize};
-use tracing::{error, info};
+use tracing::{error, info, warn};
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const DEFAULT_LIMIT: i64 = 100;
+const MAX_LIMIT: i64 = 1000;
+const DEFAULT_OFFSET: i64 = 0;
+const MAX_OFFSET: i64 = 100_000;
+const MAX_STRING_LEN: usize = 1000;
+const MAX_PURGE_DAYS: i64 = 3650; // 10 years
+
+// ============================================================================
+// Input validation helpers
+// ============================================================================
+
+/// Trim a string and return None if empty after trimming.
+fn trim_opt(s: Option<String>) -> Option<String> {
+    s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+}
+
+/// Trim a string, return error if empty after trimming.
+fn require_trimmed(args: &serde_json::Value, key: &str) -> Result<String, String> {
+    match get_str(args, key) {
+        Some(v) => {
+            let trimmed = v.trim().to_string();
+            if trimmed.is_empty() {
+                Err(format!("Parameter '{}' must not be empty or whitespace-only", key))
+            } else if trimmed.len() > MAX_STRING_LEN {
+                Err(format!("Parameter '{}' exceeds maximum length of {} characters", key, MAX_STRING_LEN))
+            } else {
+                Ok(trimmed)
+            }
+        }
+        None => Err(format!("Missing required parameter: {}", key)),
+    }
+}
+
+/// Validate an optional string param: trim, reject if too long.
+fn validate_opt_string(args: &serde_json::Value, key: &str) -> Result<Option<String>, String> {
+    match trim_opt(get_str(args, key)) {
+        Some(v) if v.len() > MAX_STRING_LEN => {
+            Err(format!("Parameter '{}' exceeds maximum length of {} characters", key, MAX_STRING_LEN))
+        }
+        other => Ok(other),
+    }
+}
+
+/// Validate an ISO 8601 date string (YYYY-MM-DD or full datetime).
+fn validate_date(value: &str, param_name: &str) -> Result<(), String> {
+    // Accept YYYY-MM-DD
+    if chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok() {
+        return Ok(());
+    }
+    // Accept full ISO 8601 datetime
+    if value.parse::<chrono::DateTime<chrono::Utc>>().is_ok() {
+        return Ok(());
+    }
+    // Accept datetime with offset
+    if chrono::DateTime::parse_from_rfc3339(value).is_ok() {
+        return Ok(());
+    }
+    Err(format!(
+        "Parameter '{}' is not a valid date. Expected ISO 8601 format (e.g. '2025-01-01' or '2025-01-01T00:00:00Z'), got: '{}'",
+        param_name, value
+    ))
+}
+
+/// Validate an optional date param: trim, check format.
+fn validate_opt_date(args: &serde_json::Value, key: &str) -> Result<Option<String>, String> {
+    match trim_opt(get_str(args, key)) {
+        Some(v) => {
+            validate_date(&v, key)?;
+            Ok(Some(v))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Validate and clamp limit parameter.
+fn validated_limit(args: &serde_json::Value) -> i64 {
+    get_i64(args, "limit")
+        .unwrap_or(DEFAULT_LIMIT)
+        .max(1)
+        .min(MAX_LIMIT)
+}
+
+/// Validate and clamp offset parameter.
+fn validated_offset(args: &serde_json::Value) -> i64 {
+    get_i64(args, "offset")
+        .unwrap_or(DEFAULT_OFFSET)
+        .max(0)
+        .min(MAX_OFFSET)
+}
 
 // ============================================================================
 // Data types
@@ -69,6 +163,14 @@ pub struct PurgeResult {
     pub older_than_days: i64,
 }
 
+#[derive(Debug, Serialize)]
+pub struct PaginatedResult<T: Serialize> {
+    pub data: Vec<T>,
+    pub limit: i64,
+    pub offset: i64,
+    pub count: usize,
+}
+
 // ============================================================================
 // Tool definitions
 // ============================================================================
@@ -101,7 +203,7 @@ fn build_tools() -> Vec<Tool> {
         Tool {
             name: "query_audit".into(),
             title: None,
-            description: Some("Query audit logs with filters: agent, action, entity_type, entity_id, date range. All filters are optional.".into()),
+            description: Some("Query audit logs with filters: agent, action, entity_type, entity_id, date range. All filters are optional. Supports pagination via limit/offset.".into()),
             input_schema: make_schema(
                 serde_json::json!({
                     "agent": { "type": "string", "description": "Filter by agent name" },
@@ -110,7 +212,8 @@ fn build_tools() -> Vec<Tool> {
                     "entity_id": { "type": "string", "description": "Filter by entity ID" },
                     "since": { "type": "string", "description": "Start date (ISO 8601, e.g. 2025-01-01)" },
                     "until": { "type": "string", "description": "End date (ISO 8601, e.g. 2025-12-31)" },
-                    "limit": { "type": "integer", "description": "Max rows to return (default 100)" }
+                    "limit": { "type": "integer", "description": "Max rows to return (default 100, max 1000)" },
+                    "offset": { "type": "integer", "description": "Number of rows to skip (default 0, max 100000)" }
                 }),
                 vec![],
             ),
@@ -123,12 +226,13 @@ fn build_tools() -> Vec<Tool> {
         Tool {
             name: "entity_history".into(),
             title: None,
-            description: Some("Get the full change history for a single entity, ordered chronologically".into()),
+            description: Some("Get the full change history for a single entity, ordered chronologically. Supports pagination via limit/offset.".into()),
             input_schema: make_schema(
                 serde_json::json!({
                     "entity_type": { "type": "string", "description": "Type of entity (e.g. deal, contact)" },
                     "entity_id": { "type": "string", "description": "ID of the entity" },
-                    "limit": { "type": "integer", "description": "Max rows (default 100)" }
+                    "limit": { "type": "integer", "description": "Max rows (default 100, max 1000)" },
+                    "offset": { "type": "integer", "description": "Number of rows to skip (default 0)" }
                 }),
                 vec!["entity_type", "entity_id"],
             ),
@@ -141,12 +245,13 @@ fn build_tools() -> Vec<Tool> {
         Tool {
             name: "agent_activity".into(),
             title: None,
-            description: Some("Get all actions performed by a specific agent, ordered by most recent first".into()),
+            description: Some("Get all actions performed by a specific agent, ordered by most recent first. Supports pagination via limit/offset.".into()),
             input_schema: make_schema(
                 serde_json::json!({
                     "agent": { "type": "string", "description": "Agent name to look up" },
                     "since": { "type": "string", "description": "Start date (ISO 8601)" },
-                    "limit": { "type": "integer", "description": "Max rows (default 100)" }
+                    "limit": { "type": "integer", "description": "Max rows (default 100, max 1000)" },
+                    "offset": { "type": "integer", "description": "Number of rows to skip (default 0)" }
                 }),
                 vec!["agent"],
             ),
@@ -192,12 +297,13 @@ fn build_tools() -> Vec<Tool> {
         Tool {
             name: "compliance_report".into(),
             title: None,
-            description: Some("Generate a compliance report: all changes in a time period with actor attribution, counts, and unique agents".into()),
+            description: Some("Generate a compliance report: all changes in a time period with actor attribution, counts, and unique agents. Supports pagination via limit/offset.".into()),
             input_schema: make_schema(
                 serde_json::json!({
                     "since": { "type": "string", "description": "Period start (ISO 8601)" },
                     "until": { "type": "string", "description": "Period end (ISO 8601, default now)" },
-                    "limit": { "type": "integer", "description": "Max entries in report (default 500)" }
+                    "limit": { "type": "integer", "description": "Max entries in report (default 500, max 1000)" },
+                    "offset": { "type": "integer", "description": "Number of entries to skip (default 0)" }
                 }),
                 vec!["since"],
             ),
@@ -213,7 +319,7 @@ fn build_tools() -> Vec<Tool> {
             description: Some("Delete audit logs older than N days. Returns the number of rows deleted.".into()),
             input_schema: make_schema(
                 serde_json::json!({
-                    "older_than_days": { "type": "integer", "description": "Delete logs older than this many days" }
+                    "older_than_days": { "type": "integer", "description": "Delete logs older than this many days (1-3650)" }
                 }),
                 vec!["older_than_days"],
             ),
@@ -243,23 +349,54 @@ impl AuditMcpServer {
     // ---- Tool handlers ----
 
     async fn handle_log_action(&self, args: &serde_json::Value) -> CallToolResult {
-        let agent = match get_str(args, "agent") {
-            Some(a) => a,
-            None => return error_result("Missing required parameter: agent"),
+        let agent = match require_trimmed(args, "agent") {
+            Ok(v) => v,
+            Err(e) => return error_result(&e),
         };
-        let action = match get_str(args, "action") {
-            Some(a) => a,
-            None => return error_result("Missing required parameter: action"),
+        let action = match require_trimmed(args, "action") {
+            Ok(v) => v,
+            Err(e) => return error_result(&e),
         };
-        let entity_type = get_str(args, "entity_type").unwrap_or_default();
-        let entity_id = get_str(args, "entity_id").unwrap_or_default();
+        let entity_type = trim_opt(get_str(args, "entity_type")).unwrap_or_default();
+        let entity_id = trim_opt(get_str(args, "entity_id")).unwrap_or_default();
+
+        // Validate string lengths for optional fields
+        if entity_type.len() > MAX_STRING_LEN {
+            return error_result(&format!("Parameter 'entity_type' exceeds maximum length of {} characters", MAX_STRING_LEN));
+        }
+        if entity_id.len() > MAX_STRING_LEN {
+            return error_result(&format!("Parameter 'entity_id' exceeds maximum length of {} characters", MAX_STRING_LEN));
+        }
+
         let details = args
             .get("details")
             .cloned()
             .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+
+        // Validate details is an object
+        if !details.is_object() {
+            return error_result("Parameter 'details' must be a JSON object");
+        }
+
         let before = args.get("before").cloned();
+        if let Some(ref b) = before {
+            if !b.is_object() && !b.is_null() {
+                return error_result("Parameter 'before' must be a JSON object or null");
+            }
+        }
+
         let after = args.get("after").cloned();
-        let ip = get_str(args, "ip").unwrap_or_default();
+        if let Some(ref a) = after {
+            if !a.is_object() && !a.is_null() {
+                return error_result("Parameter 'after' must be a JSON object or null");
+            }
+        }
+
+        let ip = trim_opt(get_str(args, "ip")).unwrap_or_default();
+        if ip.len() > 45 {
+            // Max length for IPv6-mapped IPv4
+            return error_result("Parameter 'ip' exceeds maximum length of 45 characters");
+        }
 
         let id = uuid::Uuid::new_v4().to_string();
 
@@ -281,24 +418,43 @@ impl AuditMcpServer {
         .await
         {
             Ok(log) => {
-                info!(agent = agent, action = action, entity_type = entity_type, entity_id = entity_id, "Audit log recorded");
+                info!(agent = %agent, action = %action, entity_type = %entity_type, entity_id = %entity_id, "Audit log recorded");
                 json_result(&log)
             }
             Err(e) => {
-                error!(error = %e, "Failed to insert audit log");
+                error!(error = %e, agent = %agent, action = %action, "Failed to insert audit log");
                 error_result(&format!("Failed to log action: {e}"))
             }
         }
     }
 
     async fn handle_query_audit(&self, args: &serde_json::Value) -> CallToolResult {
-        let agent = get_str(args, "agent");
-        let action = get_str(args, "action");
-        let entity_type = get_str(args, "entity_type");
-        let entity_id = get_str(args, "entity_id");
-        let since = get_str(args, "since");
-        let until = get_str(args, "until");
-        let limit = get_i64(args, "limit").unwrap_or(100).min(1000);
+        let agent = match validate_opt_string(args, "agent") {
+            Ok(v) => v,
+            Err(e) => return error_result(&e),
+        };
+        let action = match validate_opt_string(args, "action") {
+            Ok(v) => v,
+            Err(e) => return error_result(&e),
+        };
+        let entity_type = match validate_opt_string(args, "entity_type") {
+            Ok(v) => v,
+            Err(e) => return error_result(&e),
+        };
+        let entity_id = match validate_opt_string(args, "entity_id") {
+            Ok(v) => v,
+            Err(e) => return error_result(&e),
+        };
+        let since = match validate_opt_date(args, "since") {
+            Ok(v) => v,
+            Err(e) => return error_result(&e),
+        };
+        let until = match validate_opt_date(args, "until") {
+            Ok(v) => v,
+            Err(e) => return error_result(&e),
+        };
+        let limit = validated_limit(args);
+        let offset = validated_offset(args);
 
         // Build dynamic query with numbered parameters
         let mut conditions: Vec<String> = Vec::new();
@@ -335,9 +491,10 @@ impl AuditMcpServer {
             format!("WHERE {}", conditions.join(" AND "))
         };
 
-        param_idx += 1;
+        let limit_idx = param_idx + 1;
+        let offset_idx = param_idx + 2;
         let sql = format!(
-            "SELECT * FROM audit.logs {where_clause} ORDER BY created_at DESC LIMIT ${param_idx}"
+            "SELECT * FROM audit.logs {where_clause} ORDER BY created_at DESC LIMIT ${limit_idx} OFFSET ${offset_idx}"
         );
 
         let mut query = sqlx::query_as::<_, AuditLog>(&sql);
@@ -362,9 +519,18 @@ impl AuditMcpServer {
             query = query.bind(v);
         }
         query = query.bind(limit);
+        query = query.bind(offset);
 
         match query.fetch_all(self.db.pool()).await {
-            Ok(logs) => json_result(&logs),
+            Ok(logs) => {
+                let count = logs.len();
+                json_result(&PaginatedResult {
+                    data: logs,
+                    limit,
+                    offset,
+                    count,
+                })
+            }
             Err(e) => {
                 error!(error = %e, "Failed to query audit logs");
                 error_result(&format!("Query failed: {e}"))
@@ -372,58 +538,74 @@ impl AuditMcpServer {
         }
     }
 
-    async fn handle_entity_history(&self, entity_type: &str, entity_id: &str, limit: i64) -> CallToolResult {
+    async fn handle_entity_history(&self, entity_type: &str, entity_id: &str, limit: i64, offset: i64) -> CallToolResult {
         match sqlx::query_as::<_, AuditLog>(
-            "SELECT * FROM audit.logs WHERE entity_type = $1 AND entity_id = $2 ORDER BY created_at ASC LIMIT $3",
+            "SELECT * FROM audit.logs WHERE entity_type = $1 AND entity_id = $2 ORDER BY created_at ASC LIMIT $3 OFFSET $4",
         )
         .bind(entity_type)
         .bind(entity_id)
-        .bind(limit.min(1000))
+        .bind(limit)
+        .bind(offset)
         .fetch_all(self.db.pool())
         .await
         {
-            Ok(logs) => json_result(&logs),
+            Ok(logs) => {
+                let count = logs.len();
+                json_result(&PaginatedResult {
+                    data: logs,
+                    limit,
+                    offset,
+                    count,
+                })
+            }
             Err(e) => {
-                error!(error = %e, entity_type, entity_id, "Failed to fetch entity history");
+                error!(error = %e, entity_type = %entity_type, entity_id = %entity_id, "Failed to fetch entity history");
                 error_result(&format!("Query failed: {e}"))
             }
         }
     }
 
-    async fn handle_agent_activity(&self, agent: &str, since: Option<&str>, limit: i64) -> CallToolResult {
+    async fn handle_agent_activity(&self, agent: &str, since: Option<&str>, limit: i64, offset: i64) -> CallToolResult {
         let logs = if let Some(since_val) = since {
             sqlx::query_as::<_, AuditLog>(
-                "SELECT * FROM audit.logs WHERE agent = $1 AND created_at >= $2::timestamptz ORDER BY created_at DESC LIMIT $3",
+                "SELECT * FROM audit.logs WHERE agent = $1 AND created_at >= $2::timestamptz ORDER BY created_at DESC LIMIT $3 OFFSET $4",
             )
             .bind(agent)
             .bind(since_val)
-            .bind(limit.min(1000))
+            .bind(limit)
+            .bind(offset)
             .fetch_all(self.db.pool())
             .await
         } else {
             sqlx::query_as::<_, AuditLog>(
-                "SELECT * FROM audit.logs WHERE agent = $1 ORDER BY created_at DESC LIMIT $2",
+                "SELECT * FROM audit.logs WHERE agent = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
             )
             .bind(agent)
-            .bind(limit.min(1000))
+            .bind(limit)
+            .bind(offset)
             .fetch_all(self.db.pool())
             .await
         };
 
         match logs {
-            Ok(logs) => json_result(&logs),
+            Ok(logs) => {
+                let count = logs.len();
+                json_result(&PaginatedResult {
+                    data: logs,
+                    limit,
+                    offset,
+                    count,
+                })
+            }
             Err(e) => {
-                error!(error = %e, agent, "Failed to fetch agent activity");
+                error!(error = %e, agent = %agent, "Failed to fetch agent activity");
                 error_result(&format!("Query failed: {e}"))
             }
         }
     }
 
     async fn handle_daily_summary(&self, since: Option<&str>, until: Option<&str>) -> CallToolResult {
-        let since_val = since.unwrap_or("now() - interval '7 days'");
-        let until_val = until.unwrap_or("now()");
-
-        // Use COALESCE-style: if user passes a date string, cast it; otherwise use SQL expression
+        // Build dynamic SQL based on which date params are provided
         let sql = format!(
             r#"SELECT
                  to_char(created_at::date, 'YYYY-MM-DD') as date,
@@ -497,15 +679,18 @@ impl AuditMcpServer {
                 };
                 json_result(&diff)
             }
-            Ok(None) => error_result(&format!("Audit log entry '{id}' not found")),
+            Ok(None) => {
+                warn!(id = %id, "Audit log entry not found");
+                error_result(&format!("Audit log entry '{}' not found", id))
+            }
             Err(e) => {
-                error!(error = %e, id, "Failed to fetch audit log entry");
+                error!(error = %e, id = %id, "Failed to fetch audit log entry");
                 error_result(&format!("Query failed: {e}"))
             }
         }
     }
 
-    async fn handle_compliance_report(&self, since: &str, until: Option<&str>, limit: i64) -> CallToolResult {
+    async fn handle_compliance_report(&self, since: &str, until: Option<&str>, limit: i64, offset: i64) -> CallToolResult {
         // Get summary counts
         let count_sql = if until.is_some() {
             "SELECT count(*)::bigint as total, count(DISTINCT agent)::bigint as agents FROM audit.logs WHERE created_at >= $1::timestamptz AND created_at <= $2::timestamptz"
@@ -527,16 +712,16 @@ impl AuditMcpServer {
         let counts = match count_query.fetch_one(self.db.pool()).await {
             Ok(c) => c,
             Err(e) => {
-                error!(error = %e, "Failed to get compliance counts");
+                error!(error = %e, since = %since, "Failed to get compliance counts");
                 return error_result(&format!("Query failed: {e}"));
             }
         };
 
-        // Get entries
+        // Get entries with pagination
         let entries_sql = if until.is_some() {
-            "SELECT agent, action, entity_type, entity_id, created_at, before_state IS NOT NULL as has_before, after_state IS NOT NULL as has_after FROM audit.logs WHERE created_at >= $1::timestamptz AND created_at <= $2::timestamptz ORDER BY created_at ASC LIMIT $3"
+            "SELECT agent, action, entity_type, entity_id, created_at, before_state IS NOT NULL as has_before, after_state IS NOT NULL as has_after FROM audit.logs WHERE created_at >= $1::timestamptz AND created_at <= $2::timestamptz ORDER BY created_at ASC LIMIT $3 OFFSET $4"
         } else {
-            "SELECT agent, action, entity_type, entity_id, created_at, before_state IS NOT NULL as has_before, after_state IS NOT NULL as has_after FROM audit.logs WHERE created_at >= $1::timestamptz AND created_at <= now() ORDER BY created_at ASC LIMIT $2"
+            "SELECT agent, action, entity_type, entity_id, created_at, before_state IS NOT NULL as has_before, after_state IS NOT NULL as has_after FROM audit.logs WHERE created_at >= $1::timestamptz AND created_at <= now() ORDER BY created_at ASC LIMIT $2 OFFSET $3"
         };
 
         #[derive(sqlx::FromRow)]
@@ -554,7 +739,7 @@ impl AuditMcpServer {
         if let Some(u) = until {
             entries_query = entries_query.bind(u);
         }
-        entries_query = entries_query.bind(limit.min(1000));
+        entries_query = entries_query.bind(limit).bind(offset);
 
         let entries = match entries_query.fetch_all(self.db.pool()).await {
             Ok(rows) => rows
@@ -570,7 +755,7 @@ impl AuditMcpServer {
                 })
                 .collect(),
             Err(e) => {
-                error!(error = %e, "Failed to get compliance entries");
+                error!(error = %e, since = %since, "Failed to get compliance entries");
                 return error_result(&format!("Query failed: {e}"));
             }
         };
@@ -590,6 +775,9 @@ impl AuditMcpServer {
         if older_than_days < 1 {
             return error_result("older_than_days must be at least 1");
         }
+        if older_than_days > MAX_PURGE_DAYS {
+            return error_result(&format!("older_than_days must not exceed {}", MAX_PURGE_DAYS));
+        }
 
         let interval = format!("{older_than_days} days");
 
@@ -600,14 +788,14 @@ impl AuditMcpServer {
         {
             Ok(r) => {
                 let deleted = r.rows_affected();
-                info!(deleted, older_than_days, "Purged old audit logs");
+                info!(deleted = deleted, older_than_days = older_than_days, "Purged old audit logs");
                 json_result(&PurgeResult {
                     deleted,
                     older_than_days,
                 })
             }
             Err(e) => {
-                error!(error = %e, "Failed to purge audit logs");
+                error!(error = %e, older_than_days = older_than_days, "Failed to purge audit logs");
                 error_result(&format!("Purge failed: {e}"))
             }
         }
@@ -656,58 +844,81 @@ impl ServerHandler for AuditMcpServer {
             let args = serde_json::to_value(&request.arguments).unwrap_or(serde_json::Value::Null);
             let name_str: &str = request.name.as_ref();
 
+            info!(tool = name_str, "Tool invoked");
+
             let result = match name_str {
                 "log_action" => self.handle_log_action(&args).await,
                 "query_audit" => self.handle_query_audit(&args).await,
                 "entity_history" => {
-                    let et = get_str(&args, "entity_type");
-                    let ei = get_str(&args, "entity_id");
-                    match (et, ei) {
-                        (Some(et), Some(ei)) => {
-                            let limit = get_i64(&args, "limit").unwrap_or(100);
-                            self.handle_entity_history(&et, &ei, limit).await
-                        }
-                        _ => error_result("Missing required parameters: entity_type, entity_id"),
-                    }
+                    let et = match require_trimmed(&args, "entity_type") {
+                        Ok(v) => v,
+                        Err(e) => return Ok(error_result(&e)),
+                    };
+                    let ei = match require_trimmed(&args, "entity_id") {
+                        Ok(v) => v,
+                        Err(e) => return Ok(error_result(&e)),
+                    };
+                    let limit = validated_limit(&args);
+                    let offset = validated_offset(&args);
+                    self.handle_entity_history(&et, &ei, limit, offset).await
                 }
                 "agent_activity" => {
-                    match get_str(&args, "agent") {
-                        Some(agent) => {
-                            let since = get_str(&args, "since");
-                            let limit = get_i64(&args, "limit").unwrap_or(100);
-                            self.handle_agent_activity(&agent, since.as_deref(), limit).await
-                        }
-                        None => error_result("Missing required parameter: agent"),
-                    }
+                    let agent = match require_trimmed(&args, "agent") {
+                        Ok(v) => v,
+                        Err(e) => return Ok(error_result(&e)),
+                    };
+                    let since = match validate_opt_date(&args, "since") {
+                        Ok(v) => v,
+                        Err(e) => return Ok(error_result(&e)),
+                    };
+                    let limit = validated_limit(&args);
+                    let offset = validated_offset(&args);
+                    self.handle_agent_activity(&agent, since.as_deref(), limit, offset).await
                 }
                 "daily_summary" => {
-                    let since = get_str(&args, "since");
-                    let until = get_str(&args, "until");
+                    let since = match validate_opt_date(&args, "since") {
+                        Ok(v) => v,
+                        Err(e) => return Ok(error_result(&e)),
+                    };
+                    let until = match validate_opt_date(&args, "until") {
+                        Ok(v) => v,
+                        Err(e) => return Ok(error_result(&e)),
+                    };
                     self.handle_daily_summary(since.as_deref(), until.as_deref()).await
                 }
                 "diff_changes" => {
-                    match get_str(&args, "id") {
-                        Some(id) => self.handle_diff_changes(&id).await,
-                        None => error_result("Missing required parameter: id"),
-                    }
+                    let id = match require_trimmed(&args, "id") {
+                        Ok(v) => v,
+                        Err(e) => return Ok(error_result(&e)),
+                    };
+                    self.handle_diff_changes(&id).await
                 }
                 "compliance_report" => {
-                    match get_str(&args, "since") {
-                        Some(since) => {
-                            let until = get_str(&args, "until");
-                            let limit = get_i64(&args, "limit").unwrap_or(500);
-                            self.handle_compliance_report(&since, until.as_deref(), limit).await
-                        }
-                        None => error_result("Missing required parameter: since"),
+                    let since = match require_trimmed(&args, "since") {
+                        Ok(v) => v,
+                        Err(e) => return Ok(error_result(&e)),
+                    };
+                    if let Err(e) = validate_date(&since, "since") {
+                        return Ok(error_result(&e));
                     }
+                    let until = match validate_opt_date(&args, "until") {
+                        Ok(v) => v,
+                        Err(e) => return Ok(error_result(&e)),
+                    };
+                    let limit = get_i64(&args, "limit").unwrap_or(500).max(1).min(MAX_LIMIT);
+                    let offset = validated_offset(&args);
+                    self.handle_compliance_report(&since, until.as_deref(), limit, offset).await
                 }
                 "purge_old" => {
                     match get_i64(&args, "older_than_days") {
                         Some(days) => self.handle_purge_old(days).await,
-                        None => error_result("Missing required parameter: older_than_days"),
+                        None => error_result("Missing required parameter: older_than_days (must be an integer)"),
                     }
                 }
-                _ => error_result(&format!("Unknown tool: {}", request.name)),
+                other => {
+                    warn!(tool = other, "Unknown tool called");
+                    error_result(&format!("Unknown tool: {}", other))
+                }
             };
 
             Ok(result)
